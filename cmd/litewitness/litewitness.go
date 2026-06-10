@@ -47,7 +47,8 @@ var noListenFlag = flag.Bool("no-listen", false, "do not open any listening sock
 var keyFlag = flag.String("key", "", "SSH fingerprint (with SHA256: prefix) of the witness key")
 var bastionFlag = flag.String("bastion", "", "address of the bastion(s) to reverse proxy through, comma separated, the first online one is selected")
 var testCertFlag = flag.Bool("testcert", false, "use rootCA.pem for connections to the bastion")
-var obscurityFlag = flag.Bool("obscurity", false, "enable obscurity mode (disable / and /logz endpoints)")
+var obscurityFlag = flag.Bool("obscurity", false, "enable obscurity mode (hides \"/\", \"/logz\", and \"/metrics\" from clients)")
+var metricsAtFlag = flag.String("metrics-at", "", "serve \"/metrics\" on a separate addr:port")
 
 type ConnectionSet struct {
 	connections map[string]func() // connection => cancel func
@@ -138,16 +139,20 @@ func main() {
 	witnessMetrics := prometheus.WrapRegistererWithPrefix("witness_", litewitnessMetrics)
 	witnessMetrics.MustRegister(w.Metrics()...)
 
+	metricsHandler := promhttp.HandlerFor(metricsRegistry, promhttp.HandlerOpts{
+		ErrorLog: slog.NewLogLogger(slog.Default().Handler().WithAttrs(
+			[]slog.Attr{slog.String("source", "metrics")},
+		), slog.LevelWarn),
+	})
+
 	mux := http.NewServeMux()
 	mux.Handle("/", w)
 	if !*obscurityFlag {
 		mux.Handle("/logz", console)
 		mux.Handle("/{$}", indexHandler(w))
-		mux.Handle("/metrics", promhttp.HandlerFor(metricsRegistry, promhttp.HandlerOpts{
-			ErrorLog: slog.NewLogLogger(slog.Default().Handler().WithAttrs(
-				[]slog.Attr{slog.String("source", "metrics")},
-			), slog.LevelWarn),
-		}))
+		if *metricsAtFlag == "" {
+			mux.Handle("/metrics", metricsHandler)
+		}
 	}
 
 	srv := &http.Server{
@@ -247,12 +252,30 @@ func main() {
 		slog.Warn("configured to not open a listening port, but no bastions configured")
 	}
 
+	var metricsSrv *http.Server
+	if *metricsAtFlag != "" {
+		metricsSrv = &http.Server{
+			Addr:         *metricsAtFlag,
+			Handler:      http.MaxBytesHandler(metricsHandler, 10*1024),
+			ReadTimeout:  5 * time.Second,
+			WriteTimeout: 5 * time.Second,
+			BaseContext:  func(net.Listener) context.Context { return ctx },
+		}
+		go func() {
+			slog.Info("listening for metrics", "addr", *metricsAtFlag)
+			metricsSrv.ListenAndServe()
+		}()
+	}
+
 	select {
 	case <-ctx.Done():
 		slog.Info("shutting down")
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		srv.Shutdown(ctx)
+		if metricsSrv != nil {
+			metricsSrv.Shutdown(ctx)
+		}
 	case err := <-e:
 		fatal("server error", "err", err)
 	}
